@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>拼图工具（裁剪 / 保存 / 观感优化）</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+
+<style>
+body {
+  font-family: system-ui;
+  background: #f5f5f5;
+  padding: 20px;
+}
+
+.panel {
+  background: #fff;
+  padding: 16px;
+  border-radius: 8px;
+  max-width: 900px;
+}
+
+label { display:block; margin-top:12px; font-size:13px }
+input, select, button { width:100%; padding:8px; margin-top:6px }
+
+#preview {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:16px;
+}
+
+.thumb {
+  width:100px;
+  cursor:pointer;
+  border:2px solid transparent;
+}
+.thumb:hover { border-color:#999 }
+
+.canvas-wrap {
+  margin-top: 24px;
+  background:#fff;
+  padding:12px;
+  border-radius:8px;
+  display:flex;
+  justify-content:center;
+}
+
+canvas {
+  max-width: 100%;
+  max-height: 70vh;   /* 👈 关键：限制显示高度 */
+  height: auto;
+  width: auto;
+  border:1px solid #ccc;
+}
+
+/* 裁剪弹层 */
+#cropper {
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,.6);
+  display:none;
+  align-items:center;
+  justify-content:center;
+  z-index:10;
+}
+#cropBox { position:relative; background:#222 }
+#cropCanvas { display:block }
+#cropRect {
+  position:absolute;
+  border:2px solid #4af;
+  cursor:move;
+}
+.crop-ui {
+  background:#fff;
+  padding:12px;
+  display:flex;
+  gap:8px;
+  justify-content:center;
+}
+</style>
+</head>
+<body>
+
+<h2>🧩 拼图工具</h2>
+
+<div class="panel">
+  <label>上传图片 / PDF（可多选）
+    <input type="file" id="file" multiple accept="image/*,application/pdf">
+  </label>
+
+  <label>PDF 页码
+    <input id="pages" placeholder="1-3,5">
+  </label>
+
+  <label>拼图样式
+    <select id="style">
+      <option value="grid">网格</option>
+      <option value="horizontal">横向</option>
+      <option value="vertical">纵向</option>
+    </select>
+  </label>
+
+  <label>网格尺寸（列x行）
+    <input id="grid" value="2x2">
+  </label>
+
+  <label>裁剪比例
+    <select id="cropRatio">
+      <option value="auto">自动</option>
+      <option value="1:1">1:1</option>
+      <option value="4:5">4:5</option>
+      <option value="16:9">16:9</option>
+    </select>
+  </label>
+
+  <button id="generate">生成拼图</button>
+  <button id="save">保存拼图（PNG）</button>
+</div>
+
+<div id="preview"></div>
+
+<div class="canvas-wrap">
+  <canvas id="canvas"></canvas>
+</div>
+
+<!-- 裁剪器 -->
+<div id="cropper">
+  <div>
+    <div id="cropBox">
+      <canvas id="cropCanvas"></canvas>
+      <div id="cropRect"></div>
+    </div>
+    <div class="crop-ui">
+      <button id="applyCrop">应用裁剪</button>
+      <button id="cancelCrop">取消</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let items=[], currentCropIndex=null;
+const preview=document.getElementById('preview');
+const canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d');
+
+/* ---------- 文件加载 ---------- */
+file.onchange=async e=>{
+  items=[]; preview.innerHTML='';
+  for(const f of e.target.files){
+    if(f.type==='application/pdf'){
+      const pdf=await pdfjsLib.getDocument(URL.createObjectURL(f)).promise;
+      for(const p of parsePages(pages.value)){
+        const page=await pdf.getPage(p);
+        const vp=page.getViewport({scale:2});
+        const c=document.createElement('canvas');
+        c.width=vp.width; c.height=vp.height;
+        await page.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
+        addItem(c);
+      }
+    } else {
+      const img=new Image();
+      img.src=URL.createObjectURL(f);
+      await img.decode();
+      addItem(img);
+    }
+  }
+};
+
+function addItem(el){
+  items.push(el);
+  const img=document.createElement('img');
+  img.src=el.toDataURL?el.toDataURL():el.src;
+  img.className='thumb';
+  img.onclick=()=>openCrop(items.indexOf(el));
+  preview.appendChild(img);
+}
+
+/* ---------- 裁剪 ---------- */
+const cropper=document.getElementById('cropper');
+const cropCanvas=document.getElementById('cropCanvas');
+const cropRect=document.getElementById('cropRect');
+const cropCtx=cropCanvas.getContext('2d');
+
+function openCrop(index){
+  currentCropIndex=index;
+  const img=items[index];
+  cropCanvas.width=img.width;
+  cropCanvas.height=img.height;
+  cropCtx.drawImage(img,0,0);
+
+  const ratio=getRatio();
+  const w=img.width*0.6;
+  const h=ratio==='auto'?img.height*0.6:w/ratio;
+  cropRect.style.width=w+'px';
+  cropRect.style.height=h+'px';
+  cropRect.style.left=(img.width-w)/2+'px';
+  cropRect.style.top=(img.height-h)/2+'px';
+
+  cropper.style.display='flex';
+  makeDraggable(cropRect);
+}
+
+applyCrop.onclick=()=>{
+  const img=items[currentCropIndex];
+  const r=cropRect.getBoundingClientRect();
+  const c=cropCanvas.getBoundingClientRect();
+  const sx=r.left-c.left, sy=r.top-c.top;
+  const sw=r.width, sh=r.height;
+
+  const out=document.createElement('canvas');
+  out.width=sw; out.height=sh;
+  out.getContext('2d').drawImage(img,sx,sy,sw,sh,0,0,sw,sh);
+  items[currentCropIndex]=out;
+  preview.children[currentCropIndex].src=out.toDataURL();
+  cropper.style.display='none';
+};
+
+cancelCrop.onclick=()=>cropper.style.display='none';
+
+function makeDraggable(el){
+  let ox,oy,drag=false;
+  el.onmousedown=e=>{drag=true; ox=e.offsetX; oy=e.offsetY};
+  window.onmousemove=e=>{
+    if(!drag) return;
+    el.style.left=(e.pageX-cropCanvas.offsetLeft-ox)+'px';
+    el.style.top=(e.pageY-cropCanvas.offsetTop-oy)+'px';
+  };
+  window.onmouseup=()=>drag=false;
+}
+
+function getRatio(){
+  const v=cropRatio.value;
+  if(v==='auto') return 'auto';
+  const [a,b]=v.split(':').map(Number);
+  return a/b;
+}
+
+/* ---------- 拼图 ---------- */
+generate.onclick=()=>{
+  if(!items.length) return alert('没有素材');
+  style.value==='grid'?drawGrid():drawLine(style.value==='horizontal');
+};
+
+function drawGrid(){
+  const [c,r]=grid.value.split('x').map(Number);
+  const w=items[0].width, h=items[0].height;
+  canvas.width=c*w; canvas.height=r*h;
+  let i=0;
+  for(let y=0;y<r;y++)
+    for(let x=0;x<c;x++)
+      ctx.drawImage(items[i++%items.length],x*w,y*h);
+}
+
+function drawLine(horizontal){
+  canvas.width=horizontal?items.reduce((a,i)=>a+i.width,0):items[0].width;
+  canvas.height=horizontal?items[0].height:items.reduce((a,i)=>a+i.height,0);
+  let x=0,y=0;
+  items.forEach(i=>{
+    ctx.drawImage(i,x,y);
+    horizontal?x+=i.width:y+=i.height;
+  });
+}
+
+/* ---------- 保存 ---------- */
+save.onclick=()=>{
+  if(!canvas.width) return alert('请先生成拼图');
+  const a=document.createElement('a');
+  a.download='puzzle.png';
+  a.href=canvas.toDataURL('image/png');
+  a.click();
+};
+
+function parsePages(s){
+  if(!s) return [];
+  const set=new Set();
+  s.split(',').forEach(p=>{
+    if(p.includes('-')){
+      let[a,b]=p.split('-').map(Number);
+      for(let i=a;i<=b;i++) set.add(i);
+    } else set.add(+p);
+  });
+  return [...set].filter(n=>n>0);
+}
+</script>
+</body>
+</html>
+
